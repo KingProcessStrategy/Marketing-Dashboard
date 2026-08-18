@@ -17,7 +17,8 @@ type Lead = {
 };
 type Draft = {
   id: string; prospect_id: string; lead_ids: string[]; subject: string; body: string;
-  status: "ready" | "approved" | "passed"; updated_at: string;
+  status: "ready" | "approved" | "passed" | "failed"; updated_at: string;
+  sent_at: string | null; resend_message_id: string | null; send_error: string | null;
 };
 type FollowUp = { id: string; prospect_id: string; due_date: string; note: string; status: string };
 type Activity = { id: string; actor: string; action: string; detail: string; created_at: string };
@@ -93,7 +94,7 @@ export function WorkspaceApp() {
         .order("fit_score", { ascending: false })
         .order("signal_date", { ascending: false })
         .limit(300),
-      supabase.from("outreach_drafts").select("id, prospect_id, lead_ids, subject, body, status, updated_at").order("updated_at", { ascending: false }),
+      supabase.from("outreach_drafts").select("id, prospect_id, lead_ids, subject, body, status, updated_at, sent_at, resend_message_id, send_error").order("updated_at", { ascending: false }),
       supabase.from("outreach_follow_ups").select("id, prospect_id, due_date, note, status").eq("status", "due").order("due_date"),
       supabase.from("outreach_activity").select("id, actor, action, detail, created_at").order("created_at", { ascending: false }).limit(12),
       supabase.from("hpi_admin_users").select("id, full_name, email, role").order("role").order("full_name"),
@@ -152,12 +153,30 @@ export function WorkspaceApp() {
     } finally { setWorking(false); }
   }
 
-  async function setDraftStatus(draft: Draft, status: "approved" | "passed") {
+  async function sendDraft(draft: Draft) {
     await run(async () => {
-      const { error } = await supabase.from("outreach_drafts").update({ status, updated_at: new Date().toISOString() }).eq("id", draft.id);
+      const { data, error } = await supabase.functions.invoke("send-outreach-email", { body: { draftId: draft.id } });
+      if (error) {
+        let message = error.message;
+        const context = (error as { context?: Response }).context;
+        if (context && typeof context.json === "function") {
+          try {
+            const body = await context.json();
+            if (body?.error) message = body.error;
+          } catch { /* fall back to error.message */ }
+        }
+        throw new Error(message);
+      }
+      return "Email sent.";
+    });
+  }
+
+  async function passDraft(draft: Draft) {
+    await run(async () => {
+      const { error } = await supabase.from("outreach_drafts").update({ status: "passed", updated_at: new Date().toISOString() }).eq("id", draft.id);
       if (error) throw error;
-      await record(status === "approved" ? "approved a draft for queueing" : "passed a draft", draft.subject);
-      return status === "approved" ? "Draft moved to the approved queue." : "Draft marked as passed.";
+      await record("passed a draft", draft.subject);
+      return "Draft marked as passed.";
     });
   }
 
@@ -245,7 +264,7 @@ export function WorkspaceApp() {
     </aside>
     <section className="workspace">
       {message && <div className="status-message" role="status"><span>{message}</span><button onClick={() => setMessage("")} aria-label="Dismiss message">×</button></div>}
-      {section === "today" && <TodayDesk workspace={workspace} selectedDraft={selectedDraft} selectedProspect={selectedProspect} readyDrafts={readyDrafts} selectDraft={setSelectedDraftId} onApprove={() => selectedDraft && void setDraftStatus(selectedDraft, "approved")} onPass={() => selectedDraft && void setDraftStatus(selectedDraft, "passed")} onCopy={copyDraft} working={working} />}
+      {section === "today" && <TodayDesk workspace={workspace} selectedDraft={selectedDraft} selectedProspect={selectedProspect} readyDrafts={readyDrafts} selectDraft={setSelectedDraftId} onApprove={() => selectedDraft && void sendDraft(selectedDraft)} onPass={() => selectedDraft && void passDraft(selectedDraft)} onCopy={copyDraft} working={working} />}
       {section === "leads" && <LeadDesk leads={workspace.leads} />}
       {section === "prospects" && <ProspectDesk prospects={workspace.prospects} showForm={showProspectForm} setShowForm={setShowProspectForm} onSubmit={createProspect} onGenerate={generateDraft} working={working} />}
       {section === "followups" && <FollowUpDesk followUps={workspace.followUps} prospects={prospectById} onComplete={completeFollowUp} working={working} />}
@@ -307,9 +326,9 @@ function NavItem({ active, label, count, onClick }: { active: boolean; label: st
 function TodayDesk({ workspace, selectedDraft, selectedProspect, readyDrafts, selectDraft, onApprove, onPass, onCopy, working }: { workspace: Workspace; selectedDraft?: Draft; selectedProspect?: Prospect; readyDrafts: Draft[]; selectDraft: (id: string) => void; onApprove: () => void; onPass: () => void; onCopy: (draft: Draft) => void; working: boolean }) {
   const topLeads = workspace.leads.slice(0, 8);
   return <><header className="topbar"><div><p className="eyebrow">Outreach workspace</p><h1>Turn today&apos;s signals into tomorrow&apos;s calls.</h1><p className="subhead">Review the best-fit projects, then approve outreach one message at a time.</p></div><button className="primary-button" onClick={() => document.getElementById("draft-review")?.scrollIntoView({ behavior: "smooth" })}>Review {readyDrafts.length} drafts</button></header>
-    <section className="metrics" aria-label="Today’s metrics"><Metric label="Live leads" value={String(workspace.leads.length)} detail="Public records, King Lead Lab feed" /><Metric label="Drafts ready" value={String(readyDrafts.length)} detail="Personalized to review" /><Metric label="Follow-ups due" value={String(workspace.followUps.length)} detail="Reply-safe queue" /><Metric label="Approved queue" value={String(workspace.drafts.filter((draft) => draft.status === "approved").length)} detail="Copy into your inbox" /></section>
+    <section className="metrics" aria-label="Today’s metrics"><Metric label="Live leads" value={String(workspace.leads.length)} detail="Public records, King Lead Lab feed" /><Metric label="Drafts ready" value={String(readyDrafts.length)} detail="Personalized to review" /><Metric label="Follow-ups due" value={String(workspace.followUps.length)} detail="Reply-safe queue" /><Metric label="Emails sent" value={String(workspace.drafts.filter((draft) => draft.status === "approved").length)} detail="Via outreach@mail.kingprocessstrategy.com" /></section>
     <section className="desk-grid"><article className="panel lead-panel"><div className="panel-heading"><div><p className="eyebrow">Matched opportunities</p><h2>Best fits to act on today</h2></div><span className="panel-total">{workspace.leads.length} live</span></div><div className="lead-list">{topLeads.map((lead) => <LeadRow lead={lead} key={lead.id} />)}</div></article>
-      <article className="panel draft-panel" id="draft-review"><div className="panel-heading"><div><p className="eyebrow">Review before queueing</p><h2>{selectedProspect?.company ?? "No drafts ready"}</h2></div></div>{selectedDraft ? <><div className="draft-selector">{workspace.drafts.filter((draft) => draft.status !== "passed").map((draft) => <button key={draft.id} onClick={() => selectDraft(draft.id)} className={draft.id === selectedDraft.id ? "selected" : ""}>{workspace.prospects.find((prospect) => prospect.id === draft.prospect_id)?.company ?? "Prospect"}</button>)}</div><p className="recipient">To: {selectedProspect?.contact_name} · {selectedProspect?.email}</p><p className={`draft-state ${selectedDraft.status}`}>{selectedDraft.status === "ready" ? "Ready for review" : selectedDraft.status === "approved" ? "Approved queue" : "Passed"}</p><div className="email-draft"><p><strong>Subject:</strong> {selectedDraft.subject}</p>{selectedDraft.body.split("\n\n").map((paragraph) => <p key={paragraph}>{paragraph}</p>)}</div><p className="send-note">Approval preserves this message in the shared queue. Mailbox delivery stays off until you connect a sending inbox.</p><div className="draft-actions"><button className="secondary-button" onClick={() => onCopy(selectedDraft)}>Copy email</button><button className="secondary-button" disabled={working || selectedDraft.status !== "ready"} onClick={onPass}>Pass</button><button className="primary-button" disabled={working || selectedDraft.status !== "ready"} onClick={onApprove}>{selectedDraft.status === "ready" ? "Approve & queue" : "Queued"}</button></div></> : <EmptyCopy title="No drafts are waiting" body="Add prospects and generate a draft to build the next review queue." />}</article></section></>;
+      <article className="panel draft-panel" id="draft-review"><div className="panel-heading"><div><p className="eyebrow">Review before queueing</p><h2>{selectedProspect?.company ?? "No drafts ready"}</h2></div></div>{selectedDraft ? <><div className="draft-selector">{workspace.drafts.filter((draft) => draft.status !== "passed").map((draft) => <button key={draft.id} onClick={() => selectDraft(draft.id)} className={draft.id === selectedDraft.id ? "selected" : ""}>{workspace.prospects.find((prospect) => prospect.id === draft.prospect_id)?.company ?? "Prospect"}</button>)}</div><p className="recipient">To: {selectedProspect?.contact_name} · {selectedProspect?.email}</p><p className={`draft-state ${selectedDraft.status}`}>{selectedDraft.status === "ready" ? "Ready for review" : selectedDraft.status === "approved" ? "Sent" : selectedDraft.status === "failed" ? `Send failed${selectedDraft.send_error ? `: ${selectedDraft.send_error}` : ""}` : "Passed"}</p><div className="email-draft"><p><strong>Subject:</strong> {selectedDraft.subject}</p>{selectedDraft.body.split("\n\n").map((paragraph) => <p key={paragraph}>{paragraph}</p>)}</div><p className="send-note">Clicking "Send email" sends it immediately from outreach@mail.kingprocessstrategy.com — there's no separate delivery step.</p><div className="draft-actions"><button className="secondary-button" onClick={() => onCopy(selectedDraft)}>Copy email</button><button className="secondary-button" disabled={working || selectedDraft.status !== "ready"} onClick={onPass}>Pass</button><button className="primary-button" disabled={working || selectedDraft.status !== "ready"} onClick={onApprove}>{selectedDraft.status === "ready" ? "Send email" : selectedDraft.status === "approved" ? "Sent" : selectedDraft.status === "failed" ? "Send failed" : "Passed"}</button></div></> : <EmptyCopy title="No drafts are waiting" body="Add prospects and generate a draft to build the next review queue." />}</article></section></>;
 }
 
 function Metric({ label, value, detail }: { label: string; value: string; detail: string }) { return <article><span>{label}</span><strong>{value}</strong><small>{detail}</small></article>; }
